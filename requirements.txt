@@ -1,7 +1,0 @@
-certifi==2025.11.12
-charset-normalizer==3.4.4
-colorama==0.4.6
-diff-match-patch==20241021
-idna==3.11
-requests==2.32.5
-urllib3==2.5.0

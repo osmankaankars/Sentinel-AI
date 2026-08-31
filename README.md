@@ -1,50 +1,92 @@
-# Sentinel-AI: Automated Code Auditor 🤖🛡️
+# Sentinel-AI
 
-> **Next-Gen SAST tool that detects vulnerabilities using AST analysis and suggests automated fixes using GenAI.**
+[![CI](https://github.com/osmankaankars/Sentinel-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/osmankaankars/Sentinel-AI/actions/workflows/ci.yml)
 
-![Python](https://img.shields.io/badge/Python-AST-blue)
-![AI](https://img.shields.io/badge/AI-GenAI_Integration-green)
-![Security](https://img.shields.io/badge/Focus-DevSecOps-red)
+Sentinel-AI is an educational proof of concept for deterministic Python AST security rules. It
+scans one local Python file, reports narrowly defined patterns, and provides manual review
+guidance. It does not call an AI service, use the network, generate patches, or modify source
+files.
 
----
+This project demonstrates how transparent rules can produce reviewable static-analysis results.
+It is not a full SAST product and does not establish that scanned code is secure.
 
-## 📖 Overview
-**Sentinel-AI** goes beyond traditional SAST tools.  
-It not only detects common vulnerabilities such as **SQL Injection**, **Hardcoded Secrets**, and insecure patterns by analyzing the **Abstract Syntax Tree (AST)**, but also generates **secure code patches** automatically using GenAI.
+## Rules
 
----
+| ID | Pattern | Reported context |
+| --- | --- | --- |
+| `SEN001` | A direct `os.system(...)` call | Line, column, and call type |
+| `SEN002` | `SELECT`, `INSERT`, `UPDATE`, or `DELETE` in the literal portion of an f-string | Line, column, and matched SQL keyword |
+| `SEN003` | A non-empty string or bytes literal assigned to a secret-like variable | Line, column, and variable name |
 
-## ⚙️ Installation
+For `SEN003`, names are split at snake-case and camel-case boundaries. The rule recognizes
+`password`, `passwd`, `secret`, or `token` components, plus `key` when paired with a context such
+as `api`, `access`, `auth`, `aws`, `private`, or `secret`. Substrings such as `monkey`, `secretary`,
+and `tokenizer` are not treated as secret names. Dynamic values such as `os.getenv("API_KEY")` are
+not literal-secret findings.
+
+Findings intentionally contain no source snippets or literal values. This reduces the chance of
+copying a hard-coded secret into terminal output, logs, or CI artifacts.
+
+## Requirements
+
+- Python 3.11 or newer
+- No third-party runtime dependencies
+
+## Usage
 
 ```bash
 git clone https://github.com/osmankaankars/Sentinel-AI.git
 cd Sentinel-AI
-pip install -r requirements.txt
+python3 sentinel.py vulnerable_app.py
 ```
 
----
+The command scans exactly one file and returns:
 
-## 🚀 Usage
+| Exit code | Meaning |
+| --- | --- |
+| `0` | The configured rules produced no findings |
+| `1` | One or more potential issues require manual review |
+| `2` | The file could not be read, decoded, or parsed, or CLI usage was invalid |
 
-Run Sentinel-AI against a target Python file:
+Python encoding cookies are honored through `tokenize.open()`, including valid non-UTF-8 source
+files. Read, encoding, and syntax failures are reported without printing source contents.
+
+## Development
+
+The test suite is offline and uses only the Python standard library:
 
 ```bash
-python sentinel.py vulnerable_app.py
+python3 -m unittest discover -s tests -v
 ```
 
-By default, it runs in **Mock Mode**, simulating AI-generated patches without calling any external APIs.
-
-To enable **live LLM-based patching**, use:
+Formatting and lint checks use Ruff:
 
 ```bash
-python sentinel.py vulnerable_app.py --mode openai --key YOUR_KEY
+ruff check .
+ruff format --check .
 ```
 
----
+CI runs the unit tests on Python 3.11, 3.12, and 3.13. Its third-party GitHub Actions are pinned to
+full commit SHAs and the workflow has read-only repository permissions.
 
-## 👨‍💻 Author
-**Osman Kaan Kars**  
-Cybersecurity Engineer | SAP Security Specialist  
+## Limitations
 
-**LinkedIn:** https://linkedin.com/in/osmankaankars  
-**GitHub:** https://github.com/osmankaankars
+- Rules are syntactic and do not perform data-flow, dependency, framework, or inter-file analysis.
+- `SEN001` intentionally matches direct `os.system` syntax only; imports and aliases are outside its
+  scope.
+- Findings can be false positives or miss vulnerabilities. A qualified reviewer must validate them.
+- Sentinel-AI never remediates or rewrites code automatically.
+
+Use the scanner only on code you are authorized to inspect.
+
+## Author
+
+Osman Kaan Kars — Senior Cybersecurity Engineer at SchutzOn
+
+[LinkedIn](https://www.linkedin.com/in/osman-kaan-kars/) ·
+[GitHub](https://github.com/osmankaankars)
+
+## License
+
+No license is granted for this repository. All rights are reserved. Contact the author before
+copying, modifying, or redistributing the code.

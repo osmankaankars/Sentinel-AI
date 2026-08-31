@@ -1,161 +1,216 @@
-import ast
-import os
+"""A small, deterministic AST rules demonstration for Python source files."""
+
+from __future__ import annotations
+
 import argparse
-import requests
-from colorama import Fore, Style, init
-from diff_match_patch import diff_match_patch
+import ast
+import re
+import sys
+import tokenize
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
 
-# Renkleri başlat
-init(autoreset=True)
+SQL_KEYWORD_PATTERN = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
+DIRECT_SECRET_TERMS = frozenset({"password", "passwd", "secret", "token"})
+KEY_CONTEXT_TERMS = frozenset({"access", "api", "auth", "aws", "private", "secret"})
 
-class Vulnerability:
-    def __init__(self, lineno, vuln_type, code_snippet, description):
-        self.lineno = lineno
-        self.vuln_type = vuln_type
-        self.code_snippet = code_snippet
-        self.description = description
+
+@dataclass(frozen=True)
+class Finding:
+    """A finding containing metadata only, never a source-code snippet."""
+
+    rule_id: str
+    title: str
+    line: int
+    column: int
+    context: str
+    guidance: str
+
+
+class SourceLoadError(Exception):
+    """Raised when a source file cannot be read using its declared encoding."""
+
+
+def _identifier_parts(name: str) -> set[str]:
+    """Split snake_case and camelCase identifiers into lowercase components."""
+
+    with_acronym_boundaries = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", name)
+    with_camel_boundaries = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", with_acronym_boundaries)
+    return {part.lower() for part in re.split(r"[^A-Za-z0-9]+", with_camel_boundaries) if part}
+
+
+def _is_secret_like_name(name: str) -> bool:
+    parts = _identifier_parts(name)
+    if parts & DIRECT_SECRET_TERMS:
+        return True
+    return "key" in parts and bool(parts & KEY_CONTEXT_TERMS)
+
+
+def _is_nonempty_text_literal(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)) and bool(node.value)
+    )
+
 
 class CodeAnalyzer(ast.NodeVisitor):
-    """
-    Static Analysis Security Testing (SAST) engine using Abstract Syntax Tree.
-    """
-    def __init__(self, source_code):
-        self.source_code = source_code.splitlines()
-        self.vulnerabilities = []
+    """Apply the three documented rules to an already parsed Python AST."""
 
-    def visit_Call(self, node):
-        if isinstance(node.func, ast.Attribute):
-            # Detect: os.system()
-            if isinstance(node.func.value, ast.Name) and node.func.value.id == 'os' and node.func.attr == 'system':
-                self.add_vuln(node, "Command Injection", "Avoid os.system(). Use subprocess.run() with shell=False.")
+    def __init__(self) -> None:
+        self.findings: list[Finding] = []
+
+    def _add(
+        self,
+        node: ast.AST,
+        *,
+        rule_id: str,
+        title: str,
+        context: str,
+        guidance: str,
+    ) -> None:
+        self.findings.append(
+            Finding(
+                rule_id=rule_id,
+                title=title,
+                line=getattr(node, "lineno", 0),
+                column=getattr(node, "col_offset", 0) + 1,
+                context=context,
+                guidance=guidance,
+            )
+        )
+
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "os"
+            and node.func.attr == "system"
+        ):
+            self._add(
+                node,
+                rule_id="SEN001",
+                title="Direct os.system call",
+                context="os.system(...) call",
+                guidance=(
+                    "Review the command boundary manually. Prefer subprocess.run with an argument "
+                    "list, shell=False, and validated input."
+                ),
+            )
         self.generic_visit(node)
 
-    def visit_Assign(self, node):
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                var_name = target.id.lower()
-                if any(secret in var_name for secret in ['key', 'secret', 'password', 'token']):
-                    if isinstance(node.value, ast.Constant): 
-                        self.add_vuln(node, "Hardcoded Secret", "Detected potential secret. Use Environment Variables.")
+    def visit_JoinedStr(self, node: ast.JoinedStr) -> None:  # noqa: N802
+        match = None
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                match = SQL_KEYWORD_PATTERN.search(value.value)
+                if match:
+                    break
+        if match:
+            keyword = match.group(1).upper()
+            self._add(
+                node,
+                rule_id="SEN002",
+                title="SQL keyword in f-string",
+                context=f"f-string containing the SQL keyword '{keyword}'",
+                guidance=(
+                    "Review this query construction manually and use the database driver's "
+                    "parameterized-query interface for data values."
+                ),
+            )
         self.generic_visit(node)
 
-    def visit_JoinedStr(self, node):
-        # Demo purpose detection for SQLi in f-strings
-        code_segment = self.source_code[node.lineno - 1]
-        if "SELECT" in code_segment.upper() or "UPDATE" in code_segment.upper():
-             self.add_vuln(node, "SQL Injection", "Possible SQL Injection via f-string. Use parameterized queries (?)")
+    def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802
+        if _is_nonempty_text_literal(node.value):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    self._check_secret_assignment(target, node)
         self.generic_visit(node)
 
-    def add_vuln(self, node, v_type, desc):
-        snippet = self.source_code[node.lineno - 1].strip()
-        self.vulnerabilities.append(Vulnerability(node.lineno, v_type, snippet, desc))
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
+        if (
+            node.value is not None
+            and _is_nonempty_text_literal(node.value)
+            and isinstance(node.target, ast.Name)
+        ):
+            self._check_secret_assignment(node.target, node)
+        self.generic_visit(node)
 
-class AIPatcher:
-    def __init__(self, mode="mock", api_key=None):
-        self.mode = mode
-        self.api_key = api_key
+    def _check_secret_assignment(self, target: ast.Name, node: ast.AST) -> None:
+        if not _is_secret_like_name(target.id):
+            return
+        self._add(
+            node,
+            rule_id="SEN003",
+            title="Literal assigned to a secret-like variable",
+            context=f"assignment to '{target.id}'",
+            guidance=(
+                "Confirm whether this is sensitive. If it is, load it from an approved secret "
+                "store or environment boundary instead of source code."
+            ),
+        )
 
-    def get_fix(self, vuln):
-        if self.mode == "mock":
-            return self._mock_fix(vuln)
-        elif self.mode == "openai":
-            return self._openai_fix(vuln)
 
-    def _mock_fix(self, vuln):
-        if vuln.vuln_type == "SQL Injection":
-            return 'cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))'
-        elif vuln.vuln_type == "Hardcoded Secret":
-            return 'aws_key = os.getenv("AWS_KEY")'
-        elif vuln.vuln_type == "Command Injection":
-            return 'subprocess.run(cmd, shell=False)'
-        return "# Fix generation failed"
+def load_python_source(path: Path) -> str:
+    """Read Python source with PEP 263 encoding-cookie support."""
 
-    def _openai_fix(self, vuln):
-        if not self.api_key:
-            return "[Error] No API Key"
-        prompt = f"Fix this python security vulnerability ({vuln.vuln_type}) in one line:\n{vuln.code_snippet}\n\nProvide ONLY the code."
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        data = {
-            "model": "gpt-3.5-turbo",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0
-        }
-        try:
-            response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data)
-            return response.json()['choices'][0]['message']['content'].strip()
-        except Exception as e:
-            return f"# API Error: {str(e)}"
-
-def visualize_diff(original, fixed):
-    """
-    Uses Google's diff-match-patch to show colorful differences.
-    """
-    dmp = diff_match_patch()
-    # Compute diff
-    diffs = dmp.diff_main(original, fixed)
-    dmp.diff_cleanupSemantic(diffs)
-    
-    print(Fore.CYAN + "    [Patch Preview]: ", end="")
-    
-    for (op, data) in diffs:
-        if op == -1: # DELETE (Red & Strikethrough effect logic)
-            print(Fore.RED + f"[-{data}-]", end="")
-        elif op == 1: # INSERT (Green)
-            print(Fore.GREEN + f"{{+{data}+}}", end="")
-        else: # EQUAL (White)
-            print(Fore.WHITE + data, end="")
-    print() # New line
-
-def main():
-    parser = argparse.ArgumentParser(description="Sentinel-AI: Automated Code Auditor")
-    parser.add_argument("file", help="Python file to scan")
-    parser.add_argument("--mode", choices=["mock", "openai"], default="mock", help="AI Mode")
-    parser.add_argument("--key", help="OpenAI API Key", default=None)
-    
-    args = parser.parse_args()
-
-    if not os.path.exists(args.file):
-        print(Fore.RED + f"[-] File {args.file} not found.")
-        return
-
-    print(Fore.CYAN + Style.BRIGHT + f"[*] Sentinel-AI scanning: {args.file}")
-    print(Fore.CYAN + f"[*] Engine: AST Analysis + {args.mode.upper()} Patcher")
-    
-    with open(args.file, "r") as f:
-        source = f.read()
-
-    analyzer = CodeAnalyzer(source)
     try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        print(Fore.RED + "[-] Syntax Error in source file. Cannot parse.")
-        return
-        
+        with tokenize.open(path) as source_file:
+            return source_file.read()
+    except (LookupError, OSError, SyntaxError, UnicodeError) as error:
+        raise SourceLoadError from error
+
+
+def scan_source(source: str, *, filename: str = "<unknown>") -> list[Finding]:
+    """Parse source and return deterministic findings without retaining source text."""
+
+    tree = ast.parse(source, filename=filename)
+    analyzer = CodeAnalyzer()
     analyzer.visit(tree)
+    return sorted(
+        analyzer.findings,
+        key=lambda finding: (finding.line, finding.column, finding.rule_id),
+    )
 
-    if not analyzer.vulnerabilities:
-        print(Fore.GREEN + "[+] Code looks clean!")
-        return
 
-    print(Fore.YELLOW + f"\n[*] Found {len(analyzer.vulnerabilities)} security issues.\n")
-    
-    patcher = AIPatcher(mode=args.mode, api_key=args.key)
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Scan one Python file with three deterministic AST security rules."
+    )
+    parser.add_argument("file", type=Path, help="Python source file to scan")
+    return parser
 
-    for i, vuln in enumerate(analyzer.vulnerabilities, 1):
-        print(Fore.MAGENTA + "="*60)
-        print(Fore.RED + Style.BRIGHT + f"ISSUE #{i}: {vuln.vuln_type}")
-        print(Fore.WHITE + f"Location: Line {vuln.lineno}")
-        print(Fore.WHITE + f"Description: {vuln.description}")
-        print(Fore.MAGENTA + "-"*60)
-        
-        print(Fore.YELLOW + "    [Original Code]: " + Fore.WHITE + vuln.code_snippet)
-        
-        # Get fix
-        fixed_code = patcher.get_fix(vuln)
-        
-        # Show Diff
-        visualize_diff(vuln.code_snippet, fixed_code)
-        print(Fore.MAGENTA + "="*60 + "\n")
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    path: Path = args.file
+
+    try:
+        source = load_python_source(path)
+    except SourceLoadError:
+        print(f"error: could not decode or read Python source: {path}", file=sys.stderr)
+        return 2
+
+    try:
+        findings = scan_source(source, filename=str(path))
+    except SyntaxError as error:
+        line = error.lineno if error.lineno is not None else "unknown"
+        print(f"error: could not parse Python source at line {line}", file=sys.stderr)
+        return 2
+
+    if not findings:
+        print(f"No findings in {path} for the 3 configured rules.")
+        print("The source file was not modified.")
+        return 0
+
+    print(f"Found {len(findings)} potential issue(s) in {path}:")
+    for finding in findings:
+        print(f"line {finding.line}, column {finding.column}: [{finding.rule_id}] {finding.title}")
+        print(f"  Context: {finding.context}")
+        print(f"  Guidance: {finding.guidance}")
+
+    print("Review each finding manually. Sentinel-AI did not modify the source file.")
+    return 1
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
