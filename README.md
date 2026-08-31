@@ -1,6 +1,7 @@
 # Sentinel-AI
 
 [![CI](https://github.com/osmankaankars/Sentinel-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/osmankaankars/Sentinel-AI/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Sentinel-AI is an educational proof of concept for deterministic Python AST security rules. It
 scans one local Python file, reports narrowly defined patterns, and provides manual review
@@ -88,5 +89,4 @@ Osman Kaan Kars — Senior Cybersecurity Engineer at SchutzOn
 
 ## License
 
-No license is granted for this repository. All rights are reserved. Contact the author before
-copying, modifying, or redistributing the code.
+Licensed under the [MIT License](LICENSE). Copyright © 2026 Osman Kaan Kars.
