@@ -80,13 +80,6 @@ full commit SHAs and the workflow has read-only repository permissions.
 
 Use the scanner only on code you are authorized to inspect.
 
-## Author
-
-Osman Kaan Kars — Senior Cybersecurity Engineer at SchutzOn
-
-[LinkedIn](https://www.linkedin.com/in/osman-kaan-kars/) ·
-[GitHub](https://github.com/osmankaankars)
-
 ## License
 
 Licensed under the [MIT License](LICENSE). Copyright © 2026 Osman Kaan Kars.
